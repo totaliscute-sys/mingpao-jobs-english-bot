@@ -13,6 +13,7 @@ import json
 import os
 from datetime import datetime, timedelta
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Suppress SSL warnings
 urllib3.disable_warnings(InsecureRequestWarning)
@@ -326,6 +327,15 @@ SEARCH_URL = f"{BASE_URL}/job/search/Jobs"
 
 # Keywords
 KEYWORDS = ["english", "英文", "英文科", "English Teacher", "老師", "教師", "老師", "英文教師"]
+
+# --- Performance / search-depth tuning ---
+NUM_PAGES = 12          # listing pages to scan (more = searches further back)
+FETCH_WORKERS = 12      # parallel HTTP workers for fetching job-detail pages
+PAGE_SLEEP = 0.3        # seconds between listing-page fetches
+# Date windows (hours) tried in order until we have >=3 jobs; widened well past
+# 7 days so the bot keeps searching further when recent posts are scarce.
+SEARCH_WINDOWS = [24, 48, 72, 168, 336, 720]  # 1d, 2d, 3d, 7d, 14d, 30d
+MIN_JOBS = 3            # target number of jobs to send
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
@@ -1064,8 +1074,11 @@ def format_message(jobs, search_hours=24):
     today = datetime.now().strftime("%Y年%m月%d日")
     msg = f"<b>📚 小學英文科教師職位</b>\n<i>更新日期：{today}</i>\n"
     
-    if search_hours > 24:
-        msg += f"<i>搜尋範圍：過去{search_hours}小時</i>\n\n"
+    if search_hours is None:
+        msg += "<i>搜尋範圍：所有可用職位</i>\n\n"
+    elif search_hours > 24:
+        days = search_hours // 24
+        msg += f"<i>搜尋範圍：過去{days}天</i>\n\n"
     else:
         msg += "\n"
     
@@ -1098,131 +1111,114 @@ def format_message(jobs, search_hours=24):
     return msg
 
 
-def verify_jobs(jobs, sent_jobs, max_verify=20):
-    """Verify jobs through full filter pipeline. Returns list of verified jobs."""
+# Cache of fetched job-detail pages keyed by URL (avoids re-fetching across passes)
+_detail_cache = {}
+
+
+def prefetch_details(jobs):
+    """Fetch all job-detail pages in PARALLEL and attach content/salary to jobs.
+
+    This is the single biggest speed-up: previously each date window re-fetched
+    the same detail pages sequentially (10x+ redundant work). Now every unique
+    job is fetched exactly once, concurrently.
+    """
+    to_fetch = [j for j in jobs if j['url'] not in _detail_cache]
+    print(f"\n🌐 並行抓取 {len(to_fetch)} 個職位詳情 ({FETCH_WORKERS} workers)...")
+    if to_fetch:
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+            future_map = {ex.submit(fetch_job_details, j['url']): j['url'] for j in to_fetch}
+            for fut in as_completed(future_map):
+                url = future_map[fut]
+                try:
+                    _detail_cache[url] = fut.result()
+                except Exception as e:
+                    print(f"   抓取失敗 {url}: {e}")
+                    _detail_cache[url] = {'content': '', 'salary': 'Not specified'}
+    for j in jobs:
+        d = _detail_cache.get(j['url'], {'content': '', 'salary': 'Not specified'})
+        j['content'] = d['content']
+        j['salary'] = d['salary']
+
+
+def classify_jobs(jobs, sent_jobs):
+    """Run each (already detail-fetched) job through the full filter pipeline ONCE.
+
+    Returns (verified, debug_results). Network is only hit here for the district
+    lookup of ACCEPTED jobs (search_school_info), so this pass is fast.
+    """
     verified = []
     debug_results = []
-    
-    for i, job in enumerate(jobs):
-        if len(verified) >= max_verify:
-            break
-        
+
+    def reject(job_title, school, reason):
+        debug_results.append({'title': job_title, 'school': school[:30],
+                              'status': 'REJECTED', 'reason': reason})
+
+    for job in jobs:
+        job_title = job['title'][:50]
+        content = job.get('content', '') or ''
+
         # Skip already sent
         if job['url'] in sent_jobs:
-            debug_results.append({
-                'title': job['title'][:50],
-                'school': job['school'][:30],
-                'status': 'SKIPPED',
-                'reason': '已發送'
-            })
+            debug_results.append({'title': job_title, 'school': job['school'][:30],
+                                  'status': 'SKIPPED', 'reason': '已發送'})
             continue
-            
-        job_title = job['title'][:50]
-        print(f"\n   {i+1}. {job_title}...")
-        details = fetch_job_details(job['url'])
-        
-        job['content'] = details['content']
-        job['salary'] = details['salary']
-        content_length = len(job['content']) if job['content'] else 0
-        print(f"      內容長度: {content_length} chars")
-        
-        # Check if it's a teaching role
-        is_teaching, teaching_reason = is_teaching_role(job['title'], job['content'])
-        if not is_teaching:
-            print(f"      ✗ 非教學職位 ({teaching_reason})")
-            debug_results.append({
-                'title': job_title,
-                'school': job['school'][:30],
-                'status': 'REJECTED',
-                'reason': f'非教學職位 ({teaching_reason})'
-            })
-            continue
-        print(f"      ✓ 教學職位 ({teaching_reason})")
 
-        # Reject teaching-assistant / support (non-degree) roles — the user only
-        # wants APSM / degree teachers, not TA / 支援教師.
+        # Teaching role?
+        is_teaching, teaching_reason = is_teaching_role(job['title'], content)
+        if not is_teaching:
+            reject(job_title, job['school'], f'非教學職位 ({teaching_reason})')
+            continue
+
+        # Reject teaching-assistant / support (non-degree) roles — user wants APSM only.
         is_support, support_kw = is_support_role(job['title'])
         if is_support:
-            print(f"      ✗ 助理/支援職位 ({support_kw})")
-            debug_results.append({
-                'title': job_title,
-                'school': job['school'][:30],
-                'status': 'REJECTED',
-                'reason': f'助理/支援職位 ({support_kw})'
-            })
+            reject(job_title, job['school'], f'助理/支援職位 ({support_kw})')
             continue
 
-        # Reject substitute/temporary teacher roles
+        # Reject substitute / temporary teacher roles
         _sub_match = next((kw for kw in SUBSTITUTE_KEYWORDS if kw in job['title'].lower()), None)
         if _sub_match:
-            print(f"      ✗ 代課職位 ({_sub_match})")
-            debug_results.append({
-                'title': job_title,
-                'school': job['school'][:30],
-                'status': 'REJECTED',
-                'reason': f'代課職位 ({_sub_match})'
-            })
+            reject(job_title, job['school'], f'代課職位 ({_sub_match})')
             continue
-        
-        # Check primary school (title is the strongest signal for APSM posts)
-        is_primary = is_confirmed_primary_school(job['school'], job['content'], job['title'])
-        if not is_primary:
-            print(f"      ✗ 非小學")
-            debug_results.append({
-                'title': job_title,
-                'school': job['school'][:30],
-                'status': 'REJECTED',
-                'reason': '非小學'
-            })
+
+        # Primary school? (title is the strongest signal for APSM posts)
+        if not is_confirmed_primary_school(job['school'], content, job['title']):
+            reject(job_title, job['school'], '非小學')
             continue
-        print(f"      ✓ 小學確認")
-        
-        # Check for social service organizations (must be actual school)
+
+        # Must be an actual school, not a social-service org
         if is_social_service_org(job['school']):
-            print(f"      ✗ 社會服務機構（非學校）")
-            debug_results.append({
-                'title': job_title,
-                'school': job['school'][:30],
-                'status': 'REJECTED',
-                'reason': '社會服務機構'
-            })
+            reject(job_title, job['school'], '社會服務機構')
             continue
-        print(f"      ✓ 確認為學校（非社福機構）")
-        
-        # Check for special school
+
         job['is_special_school'] = is_special_school(job['school'])
-        if job['is_special_school']:
-            print(f"      🏷 特殊學校")
-        
-        # English subject check (lenient logic)
-        is_english, english_reason = is_english_subject(job['title'], job['content'])
-        print(f"      英文檢查: {english_reason}")
-        
-        job['is_primary'] = is_primary
+
+        # English subject?
+        is_english, english_reason = is_english_subject(job['title'], content)
+        job['is_primary'] = True
         job['is_english'] = is_english
-        
-        if is_primary and is_english:
-            print(f"      ✓✓✓ 符合條件")
+
+        if is_english:
             job['school_info'] = search_school_info(job['school'])
             verified.append(job)
-            debug_results.append({
-                'title': job_title,
-                'school': job['school'][:30],
-                'status': 'ACCEPTED',
-                'reason': english_reason
-            })
+            debug_results.append({'title': job_title, 'school': job['school'][:30],
+                                  'status': 'ACCEPTED', 'reason': english_reason})
+            print(f"   ✓✓✓ {job_title}  ({english_reason})")
         else:
-            print(f"      ✗ 非英文科 ({english_reason})")
-            debug_results.append({
-                'title': job_title,
-                'school': job['school'][:30],
-                'status': 'REJECTED',
-                'reason': f'非英文科 ({english_reason})'
-            })
-        
-        time.sleep(1)
-    
+            reject(job_title, job['school'], f'非英文科 ({english_reason})')
+
     return verified, debug_results
+
+
+def fetch_listing_pages():
+    """Fetch all listing pages (sequentially with a short pause) and return raw HTML list."""
+    htmls = []
+    for page in range(1, NUM_PAGES + 1):
+        print(f"📄 第 {page} 頁...")
+        html = fetch_page(SEARCH_URL, {'JobAreaID[]': '10-0', 'Page': page})
+        htmls.append(html)
+        time.sleep(PAGE_SLEEP)
+    return htmls
 
 
 def main():
@@ -1230,120 +1226,84 @@ def main():
     print("明報 JUMP 小學英文科教師職位搜尋")
     print(f"開始時間: {datetime.now()}")
     print("="*60)
-    
+
+    # 1. Fetch listing pages and pre-filter candidates
     all_jobs = []
-    
-    # Fetch 10 pages
-    for page in range(1, 11):
-        print(f"\n📄 第 {page} 頁...")
-        html = fetch_page(SEARCH_URL, {'JobAreaID[]': '10-0', 'Page': page})
-        
-        if html:
-            jobs = parse_job_listings(html)
-            print(f"   找到 {len(jobs)} 個職位")
-            
-            # Check for matches
-            for job in jobs:
-                text = f"{job['title']} {job['school']}"
-                matches, kw = matches_keywords(text)
+    for html in fetch_listing_pages():
+        if not html:
+            continue
+        for job in parse_job_listings(html):
+            text = f"{job['title']} {job['school']}"
+            matches, _ = matches_keywords(text)
+            title_lower = job['title'].lower()
+            title_has_english_hint = any(
+                kw in title_lower for kw in
+                ['english', '英文', '英文科', '英文教師', '英文老師', 'english teacher']
+            )
+            if matches or is_primary_school(text) or title_has_english_hint:
+                all_jobs.append(job)
 
-                # is_english_subject() needs (title, content), can't be used here as pre-filter.
-                # Use a lightweight title-only check instead.
-                title_lower = job['title'].lower()
-                title_has_english_hint = any(
-                    kw in title_lower for kw in [
-                        'english', '英文', '英文科', '英文教師', '英文老師', 'english teacher'
-                    ]
-                )
+    # Deduplicate candidates by URL (so each detail page is fetched at most once)
+    seen_urls = set()
+    unique_jobs = []
+    for job in all_jobs:
+        if job['url'] in seen_urls:
+            continue
+        seen_urls.add(job['url'])
+        unique_jobs.append(job)
+    print(f"\n📊 初步匹配: {len(all_jobs)} 個 (去重後 {len(unique_jobs)} 個獨立職位)")
 
-                if matches or is_primary_school(text) or title_has_english_hint:
-                    print(f"   ✓ 匹配: {job['title'][:40]}...")
-                    all_jobs.append(job)
-        
-        time.sleep(2)
-    
-    print(f"\n📊 初步匹配 (日期篩選前): {len(all_jobs)} 個職位")
-    
-    # Load sent jobs to filter duplicates
     sent_jobs = load_sent_jobs()
     print(f"   已發送職位記錄: {len(sent_jobs)} 個")
-    
-    # Expansion logic: try 24h → 48h → 72h → 7d until we get 3+ verified jobs
-    search_hours_list = [24, 48, 72, 168]  # 1d, 2d, 3d, 7d
-    verified_jobs = []
-    all_debug_results = []
-    search_hours = 24
-    
-    for hours in search_hours_list:
-        # Filter by date
-        date_filtered = filter_jobs_by_date(all_jobs, hours)
-        print(f"\n{'='*60}")
-        print(f"📅 嘗試 {hours}小時窗口 ({len(date_filtered)} 個職位)")
-        print(f"{'='*60}")
-        
-        # Verify jobs through full pipeline
-        verified, debug_results = verify_jobs(date_filtered, sent_jobs, max_verify=25)
-        verified_jobs = verified
-        all_debug_results.extend(debug_results)
-        
-        print(f"\n📊 {hours}小時驗證結果: {len(verified)} 個符合條件")
-        
-        if len(verified) >= 3:
+
+    # 2. Fetch all detail pages in parallel, then classify ONCE
+    prefetch_details(unique_jobs)
+    print(f"\n{'='*60}\n🔎 驗證職位...\n{'='*60}")
+    verified_all, debug_results = classify_jobs(unique_jobs, sent_jobs)
+
+    accepted = sum(1 for r in debug_results if r['status'] == 'ACCEPTED')
+    skipped = sum(1 for r in debug_results if r['status'] == 'SKIPPED')
+    rejected = sum(1 for r in debug_results if r['status'] == 'REJECTED')
+    print(f"\n📊 驗證結果: 共 {len(debug_results)} | ✓ {accepted} | ⏭ {skipped} | ✗ {rejected}")
+    print(f"   符合條件 (未發送): {len(verified_all)} 個")
+
+    # 3. Widen the date window until we have >=MIN_JOBS; keep searching further
+    #    (14d, 30d). If still short, fall back to ALL verified jobs (incl. undated).
+    selected = []
+    search_hours = None
+    for hours in SEARCH_WINDOWS:
+        cutoff = datetime.now() - timedelta(hours=hours)
+        in_window = [j for j in verified_all if j.get('posted_date') and j['posted_date'] >= cutoff]
+        print(f"📅 {hours}小時窗口: {len(in_window)} 個符合")
+        if len(in_window) >= MIN_JOBS:
+            selected = in_window
             search_hours = hours
-            print(f"✓ 找到 {len(verified)} 個職位 (≥3)，停止擴展")
+            print(f"✓ 達標 (≥{MIN_JOBS})，停止擴展")
             break
-        elif hours < 168:
-            print(f"⚠ 只有 {len(verified)} 個職位 (<3)，繼續擴展...")
-        else:
-            search_hours = hours
-            print(f"⚠ 已達最大範圍 (7天)，共找到 {len(verified)} 個職位")
-    
-    # Print debug summary
-    print("\n" + "="*60)
-    print("DEBUG SUMMARY - 所有職位處理結果:")
-    print("="*60)
-    accepted_count = sum(1 for r in all_debug_results if r['status'] == 'ACCEPTED')
-    skipped_count = sum(1 for r in all_debug_results if r['status'] == 'SKIPPED')
-    rejected_count = sum(1 for r in all_debug_results if r['status'] == 'REJECTED')
-    print(f"總計: {len(all_debug_results)} | ✓ 接受: {accepted_count} | ⏭ 跳過: {skipped_count} | ✗ 拒絕: {rejected_count}")
-    print(f"最終搜尋範圍: {search_hours}小時")
-    print("-"*60)
-    for r in all_debug_results[:50]:  # Show first 50
-        if r['status'] == 'ACCEPTED':
-            print(f"✓ {r['title'][:45]:<45} | {r['reason']}")
-    print("="*60)
-    
-    # Deduplicate by school+title
-    verified_jobs = deduplicate_jobs(verified_jobs)
-    print(f"\n📊 去除重複後職位數量: {len(verified_jobs)}")
-    
-    all_jobs = verified_jobs
-    print(f"\n📊 驗證後職位數量: {len(all_jobs)}")
-    
-    # Filter out already sent jobs
-    new_jobs = [job for job in all_jobs if job['url'] not in sent_jobs]
-    skipped = len(all_jobs) - len(new_jobs)
-    if skipped > 0:
-        print(f"   跳過已發送: {skipped} 個")
-    print(f"   新職位: {len(new_jobs)} 個")
-    
-    # Rank and select top 3
+    if len(selected) < MIN_JOBS:
+        # Not enough recent posts anywhere — send everything we verified.
+        selected = verified_all
+        search_hours = None
+        print(f"⚠ 所有窗口都 <{MIN_JOBS}，改用全部符合職位 ({len(selected)} 個)")
+
+    # 4. Dedup by school+title, rank, and send the top jobs
+    selected = deduplicate_jobs(selected)
+    new_jobs = [job for job in selected if job['url'] not in sent_jobs]
     top_jobs = rank_jobs(new_jobs)
     print(f"\n📤 發送 {len(top_jobs)} 個職位...")
-    
+
     message = format_message(top_jobs, search_hours)
     result = send_telegram_message(message)
-    
+
     if result and result.get('ok'):
         print("✅ 發送成功!")
-        # Save sent job URLs
         for job in top_jobs:
             sent_jobs.add(job['url'])
         save_sent_jobs(sent_jobs)
         print(f"   已保存 {len(top_jobs)} 個職位到記錄")
     else:
         print(f"❌ 發送失敗: {result}")
-    
+
     print(f"\n完成時間: {datetime.now()}")
     print("="*60)
 
