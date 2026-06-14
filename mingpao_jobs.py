@@ -1099,8 +1099,11 @@ def format_message(jobs, search_hours=24):
         special_note = ""
         if job.get('is_special_school'):
             special_note = " 🏷 特殊學校"
-        
-        msg += f"<b>#{i} {title}</b>\n"
+
+        # Mark top-up jobs that were sent in a previous run
+        repeat_note = " 🔁 已發過" if job.get('already_sent') else ""
+
+        msg += f"<b>#{i} {title}</b>{repeat_note}\n"
         msg += f"🏫 {school}{special_note}\n"
         msg += f"🏛 {school_type}\n"
         msg += f"📍 {district}\n"
@@ -1156,12 +1159,9 @@ def classify_jobs(jobs, sent_jobs):
     for job in jobs:
         job_title = job['title'][:50]
         content = job.get('content', '') or ''
-
-        # Skip already sent
-        if job['url'] in sent_jobs:
-            debug_results.append({'title': job_title, 'school': job['school'][:30],
-                                  'status': 'SKIPPED', 'reason': '已發送'})
-            continue
+        # Tag (don't skip) already-sent jobs, so they can be used to top up to
+        # MIN_JOBS when there aren't enough brand-new ones.
+        job['already_sent'] = job['url'] in sent_jobs
 
         # Teaching role?
         is_teaching, teaching_reason = is_teaching_role(job['title'], content)
@@ -1201,9 +1201,10 @@ def classify_jobs(jobs, sent_jobs):
         if is_english:
             job['school_info'] = search_school_info(job['school'])
             verified.append(job)
+            tag = ' (已發過)' if job['already_sent'] else ''
             debug_results.append({'title': job_title, 'school': job['school'][:30],
-                                  'status': 'ACCEPTED', 'reason': english_reason})
-            print(f"   ✓✓✓ {job_title}  ({english_reason})")
+                                  'status': 'ACCEPTED', 'reason': english_reason + tag})
+            print(f"   ✓✓✓ {job_title}{tag}  ({english_reason})")
         else:
             reject(job_title, job['school'], f'非英文科 ({english_reason})')
 
@@ -1262,45 +1263,60 @@ def main():
     verified_all, debug_results = classify_jobs(unique_jobs, sent_jobs)
 
     accepted = sum(1 for r in debug_results if r['status'] == 'ACCEPTED')
-    skipped = sum(1 for r in debug_results if r['status'] == 'SKIPPED')
     rejected = sum(1 for r in debug_results if r['status'] == 'REJECTED')
-    print(f"\n📊 驗證結果: 共 {len(debug_results)} | ✓ {accepted} | ⏭ {skipped} | ✗ {rejected}")
-    print(f"   符合條件 (未發送): {len(verified_all)} 個")
+    new_verified = [j for j in verified_all if not j.get('already_sent')]
+    sent_verified = [j for j in verified_all if j.get('already_sent')]
+    print(f"\n📊 驗證結果: 共 {len(debug_results)} | ✓ {accepted} | ✗ {rejected}")
+    print(f"   符合條件: {len(verified_all)} 個 (未發送 {len(new_verified)} / 已發過 {len(sent_verified)})")
 
-    # 3. Widen the date window until we have >=MIN_JOBS; keep searching further
-    #    (14d, 30d). If still short, fall back to ALL verified jobs (incl. undated).
+    # 3. Pick NEW jobs first, widening the date window (14d, 30d) and finally
+    #    falling back to all new verified jobs (incl. undated).
     selected = []
     search_hours = None
     for hours in SEARCH_WINDOWS:
         cutoff = datetime.now() - timedelta(hours=hours)
-        in_window = [j for j in verified_all if j.get('posted_date') and j['posted_date'] >= cutoff]
-        print(f"📅 {hours}小時窗口: {len(in_window)} 個符合")
+        in_window = [j for j in new_verified if j.get('posted_date') and j['posted_date'] >= cutoff]
+        print(f"📅 {hours}小時窗口: {len(in_window)} 個新職位")
         if len(in_window) >= MIN_JOBS:
             selected = in_window
             search_hours = hours
             print(f"✓ 達標 (≥{MIN_JOBS})，停止擴展")
             break
     if len(selected) < MIN_JOBS:
-        # Not enough recent posts anywhere — send everything we verified.
-        selected = verified_all
+        selected = new_verified
         search_hours = None
-        print(f"⚠ 所有窗口都 <{MIN_JOBS}，改用全部符合職位 ({len(selected)} 個)")
+        print(f"⚠ 新職位不足 {MIN_JOBS} 個，改用全部 {len(selected)} 個新職位")
 
-    # 4. Dedup by school+title, rank, and send the top jobs
     selected = deduplicate_jobs(selected)
-    new_jobs = [job for job in selected if job['url'] not in sent_jobs]
-    top_jobs = rank_jobs(new_jobs)
-    print(f"\n📤 發送 {len(top_jobs)} 個職位...")
+    top_jobs = rank_jobs(selected)  # up to MIN_JOBS new jobs, school-diverse
 
+    # 4. Top up to MIN_JOBS with the most recent already-sent (but still valid)
+    #    jobs, clearly tagged so the user knows they are repeats.
+    if len(top_jobs) < MIN_JOBS:
+        need = MIN_JOBS - len(top_jobs)
+        chosen_urls = {j['url'] for j in top_jobs}
+        pool = deduplicate_jobs([j for j in sent_verified if j['url'] not in chosen_urls])
+        pool.sort(key=lambda x: x.get('posted_date') or datetime.min, reverse=True)
+        topups = pool[:need]
+        if topups:
+            search_hours = None  # mixed freshness once we include repeats
+            for j in topups:
+                j['already_sent'] = True
+            top_jobs += topups
+            print(f"🔁 用 {len(topups)} 個『已發過』職位補足至 {len(top_jobs)} 個")
+
+    print(f"\n📤 發送 {len(top_jobs)} 個職位...")
     message = format_message(top_jobs, search_hours)
     result = send_telegram_message(message)
 
     if result and result.get('ok'):
         print("✅ 發送成功!")
+        # Only record genuinely new jobs as sent (top-ups are already recorded).
         for job in top_jobs:
-            sent_jobs.add(job['url'])
+            if not job.get('already_sent'):
+                sent_jobs.add(job['url'])
         save_sent_jobs(sent_jobs)
-        print(f"   已保存 {len(top_jobs)} 個職位到記錄")
+        print(f"   已保存新職位到記錄 (總計 {len(sent_jobs)} 個)")
     else:
         print(f"❌ 發送失敗: {result}")
 
