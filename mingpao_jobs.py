@@ -499,31 +499,37 @@ def is_primary_school(text):
     return any(ind in text.lower() for ind in indicators)
 
 
-def is_confirmed_primary_school(school_name, content):
+def is_confirmed_primary_school(school_name, content, title=''):
     """
     STRICT PRIMARY ONLY filter.
-    Excludes any job where school_name contains secondary indicators (unless it also has primary indicators).
-    Returns True if primary indicators found in school_name OR content.
-    If school_name clearly indicates primary (has 'PRIMARY' or '小學'), accept even if content is empty.
+    Considers the job TITLE as well as the school name — many primary posts
+    (e.g. 助理小學學位教師 / APSM, 小學學位教師) state 小學 in the title even when
+    the employer name or detail page does not literally contain 小學/primary.
+    Excludes jobs that clearly indicate secondary (中學/secondary) without any
+    primary indicator. Returns True if primary indicators are found in the
+    title, school name, OR content.
     """
-    if not school_name:
+    # Title is the strongest signal for APSM-style government/aided posts whose
+    # employer name omits 小學, so check it together with the school name.
+    name_text = f"{title} {school_name}".strip()
+    if not name_text:
         return False
-    
-    # Check if school name has secondary indicators but NO primary indicators - exclude
-    has_secondary_in_name = is_secondary_school(school_name)
-    has_primary_in_name = is_primary_school(school_name)
-    
-    if has_secondary_in_name and not has_primary_in_name:
+
+    has_secondary = is_secondary_school(name_text)
+    has_primary = is_primary_school(name_text)
+
+    # Secondary indicated and no primary indicator anywhere in title/name -> exclude
+    if has_secondary and not has_primary:
         return False
-    
-    # Accept if primary indicators in school name (strong signal)
-    if has_primary_in_name:
+
+    # Accept if primary indicators in title or school name (strong signal)
+    if has_primary:
         return True
-    
+
     # Otherwise check content if available
     if content and is_primary_school(content):
         return True
-    
+
     return False
 
 
@@ -543,12 +549,32 @@ SUBSTITUTE_KEYWORDS = [
     'substitute', 'relief teacher', 'supply teacher',
 ]
 
-# Teaching role indicators
+# Support / assistant (NON-degree) roles to reject.
+# The user wants APSM (助理小學學位教師, a registered degree teacher), NOT teaching
+# assistants / support teachers. These keywords are chosen so they do NOT match
+# the APSM title "助理小學學位教師" (it contains neither "教學助理" nor "助理教師").
+SUPPORT_ROLE_KEYWORDS = [
+    '教學助理', '助教', '助理教師', '支援教師', '支援老師', '學習支援', '副教師',
+    'teaching assistant', 'teacher assistant', 'associate teacher',
+    'support teacher', 'learning support',
+]
+
+# Teaching role indicators (TA / teaching assistant deliberately excluded — see
+# SUPPORT_ROLE_KEYWORDS — because the user only wants degree teachers / APSM).
 TEACHING_KEYWORDS = [
-    '教師', '老師', 'teacher', '教學助理', 'teaching assistant',
+    '教師', '老師', 'teacher',
     '學位教師', '小學學位教師', '助理小學學位教師', 'APSM', 'GM', 'SGM', 'PSM',
     '學位教師', '常額教師', '合約教師', '代課教師', '日薪代課'
 ]
+
+
+def is_support_role(title):
+    """Check if the job is a (non-degree) teaching-assistant / support role to reject."""
+    text = (title or '').lower()
+    for keyword in SUPPORT_ROLE_KEYWORDS:
+        if keyword.lower() in text:
+            return True, keyword
+    return False, None
 
 # Social service organization keywords to exclude
 SOCIAL_SERVICE_KEYWORDS = [
@@ -717,10 +743,19 @@ def is_english_subject(title, content=''):
     has_other_subject = any(subj.lower() in title_lower for subj in OTHER_SUBJECTS)
     
     if has_teaching_keyword and not has_other_subject:
-        # Check content for English - MUST find explicit English keywords
+        # Check content for English - MUST find an EXPLICIT English-SUBJECT signal.
+        # NOTE: a bare "english" / "英文" in the description is NOT enough — almost
+        # every HK teaching post asks for "good command of English", which used to
+        # cause generic posts (e.g. 支援教師/TA) to be mis-classified as English.
         if content and len(content) > 100:
-            # Content fetched successfully - check it for English keywords
-            content_has_english = any(kw in content_lower for kw in ['english', '英文科', '教英文', '任教英文', '英文教師', '英文老師'])
+            english_subject_signals = [
+                '英文科', '英語科', '英文教師', '英文老師', '英語教師', '英語老師',
+                '教英文', '任教英文', '教授英文', '英文課', '英文班',
+                'english teacher', 'teach english', 'teaching of english',
+                'english panel', 'english subject', 'english language teacher',
+                'subject teacher (english)', 'subject: english', 'panel (english)',
+            ]
+            content_has_english = any(kw in content_lower for kw in english_subject_signals)
             if content_has_english:
                 return True, 'content_has_english'
             else:
@@ -1104,6 +1139,19 @@ def verify_jobs(jobs, sent_jobs, max_verify=20):
             continue
         print(f"      ✓ 教學職位 ({teaching_reason})")
 
+        # Reject teaching-assistant / support (non-degree) roles — the user only
+        # wants APSM / degree teachers, not TA / 支援教師.
+        is_support, support_kw = is_support_role(job['title'])
+        if is_support:
+            print(f"      ✗ 助理/支援職位 ({support_kw})")
+            debug_results.append({
+                'title': job_title,
+                'school': job['school'][:30],
+                'status': 'REJECTED',
+                'reason': f'助理/支援職位 ({support_kw})'
+            })
+            continue
+
         # Reject substitute/temporary teacher roles
         _sub_match = next((kw for kw in SUBSTITUTE_KEYWORDS if kw in job['title'].lower()), None)
         if _sub_match:
@@ -1116,8 +1164,8 @@ def verify_jobs(jobs, sent_jobs, max_verify=20):
             })
             continue
         
-        # Check primary school
-        is_primary = is_confirmed_primary_school(job['school'], job['content'])
+        # Check primary school (title is the strongest signal for APSM posts)
+        is_primary = is_confirmed_primary_school(job['school'], job['content'], job['title'])
         if not is_primary:
             print(f"      ✗ 非小學")
             debug_results.append({
