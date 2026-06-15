@@ -2,8 +2,11 @@ name: Mingpao Jobs Daily
 
 on:
   schedule:
-    # 02:00 UTC = 10:00 HKT (UTC+8)
-    - cron: '0 2 * * *'
+    # 02:17 UTC = 10:17 HKT (UTC+8).
+    # Deliberately off the top of the hour: GitHub delays/skips scheduled runs
+    # most often at minute 0 during peak load, so a non-zero minute is more
+    # reliable. Scheduled runs may still be delayed by 5-20 min.
+    - cron: '17 2 * * *'
   workflow_dispatch:
 
 permissions:
