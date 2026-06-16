@@ -348,7 +348,9 @@ def search_web_for_district(school_name):
 
 # Configuration
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "892783133")
+# Read from the TELEGRAM_CHAT_ID secret (no hard-coded fallback, so the chat ID
+# is not exposed if the repo is made public).
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 BASE_URL = "https://jump.mingpao.com"
 SEARCH_URL = f"{BASE_URL}/job/search/Jobs"
 
