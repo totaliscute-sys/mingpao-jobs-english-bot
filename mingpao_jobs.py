@@ -24,6 +24,33 @@ SENT_JOBS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mingp
 # Cache file for school district lookups
 SCHOOL_DISTRICT_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'school_district_cache.json')
 
+# Guard file recording the last date (HKT) a message was sent, so that multiple
+# redundant scheduled runs in one day result in at most ONE Telegram message.
+LAST_RUN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'last_run.json')
+
+
+def hkt_today():
+    """Return today's date string in Hong Kong time (UTC+8)."""
+    return (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
+
+
+def already_sent_today():
+    try:
+        if os.path.exists(LAST_RUN_FILE):
+            with open(LAST_RUN_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f).get('last_sent_date') == hkt_today()
+    except Exception:
+        pass
+    return False
+
+
+def mark_sent_today():
+    try:
+        with open(LAST_RUN_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'last_sent_date': hkt_today()}, f)
+    except Exception as e:
+        print(f"   寫入 last_run 失敗: {e}")
+
 # HK Districts list for matching
 HK_DISTRICTS = [
     '中西區', '灣仔區', '東區', '南區', '油尖旺區', '深水埗區', 
@@ -1228,6 +1255,14 @@ def main():
     print(f"開始時間: {datetime.now()}")
     print("="*60)
 
+    # Daily guard: with several redundant cron times (to survive GitHub dropping
+    # scheduled runs), make sure a SCHEDULED trigger only sends once per HKT day.
+    # Manual workflow_dispatch always runs (so testing is unaffected).
+    event = os.environ.get('GITHUB_EVENT_NAME', '')
+    if event == 'schedule' and already_sent_today():
+        print(f"⏭ 今日 ({hkt_today()}) 已經發送過，跳過呢次排程觸發。")
+        return
+
     # 1. Fetch listing pages and pre-filter candidates
     all_jobs = []
     for html in fetch_listing_pages():
@@ -1316,6 +1351,7 @@ def main():
             if not job.get('already_sent'):
                 sent_jobs.add(job['url'])
         save_sent_jobs(sent_jobs)
+        mark_sent_today()  # block other redundant scheduled runs today
         print(f"   已保存新職位到記錄 (總計 {len(sent_jobs)} 個)")
     else:
         print(f"❌ 發送失敗: {result}")

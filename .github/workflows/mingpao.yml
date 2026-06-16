@@ -2,11 +2,13 @@ name: Mingpao Jobs Daily
 
 on:
   schedule:
-    # 02:17 UTC = 10:17 HKT (UTC+8).
-    # Deliberately off the top of the hour: GitHub delays/skips scheduled runs
-    # most often at minute 0 during peak load, so a non-zero minute is more
-    # reliable. Scheduled runs may still be delayed by 5-20 min.
-    - cron: '17 2 * * *'
+    # GitHub frequently delays or DROPS scheduled runs, so we fire 3 times in the
+    # morning as redundancy. A daily guard (last_run.json) ensures only the first
+    # successful run each HKT day actually sends a Telegram message.
+    # Off the top of the hour on purpose (minute 0 is the least reliable).
+    - cron: '17 2 * * *'   # 10:17 HKT
+    - cron: '17 3 * * *'   # 11:17 HKT
+    - cron: '17 4 * * *'   # 12:17 HKT
   workflow_dispatch:
 
 permissions:
@@ -38,6 +40,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add mingpao_sent_jobs.json school_district_cache.json || true
+          git add mingpao_sent_jobs.json school_district_cache.json last_run.json || true
           git diff --staged --quiet || git commit -m "Update job state [skip ci]"
           git push || true
