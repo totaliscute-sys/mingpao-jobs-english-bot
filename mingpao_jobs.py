@@ -1255,12 +1255,12 @@ def main():
     print(f"開始時間: {datetime.now()}")
     print("="*60)
 
-    # Daily guard: with several redundant cron times (to survive GitHub dropping
-    # scheduled runs), make sure a SCHEDULED trigger only sends once per HKT day.
-    # Manual workflow_dispatch always runs (so testing is unaffected).
-    event = os.environ.get('GITHUB_EVENT_NAME', '')
-    if event == 'schedule' and already_sent_today():
-        print(f"⏭ 今日 ({hkt_today()}) 已經發送過，跳過呢次排程觸發。")
+    # Daily guard: any number of redundant triggers (GitHub schedule, an external
+    # cron hitting the API, etc.) result in at most ONE Telegram message per HKT
+    # day. Pass FORCE_SEND=true (manual "force" dispatch) to bypass for testing.
+    force = os.environ.get('FORCE_SEND', '').strip().lower() == 'true'
+    if not force and already_sent_today():
+        print(f"⏭ 今日 ({hkt_today()}) 已經發送過，跳過。(force=true 可強制重發)")
         return
 
     # 1. Fetch listing pages and pre-filter candidates

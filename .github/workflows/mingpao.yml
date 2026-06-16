@@ -10,6 +10,11 @@ on:
     - cron: '17 3 * * *'   # 11:17 HKT
     - cron: '17 4 * * *'   # 12:17 HKT
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Send even if a message was already sent today'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -34,6 +39,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          FORCE_SEND: ${{ github.event.inputs.force }}
         run: python mingpao_jobs.py
 
       - name: Commit updated state files
