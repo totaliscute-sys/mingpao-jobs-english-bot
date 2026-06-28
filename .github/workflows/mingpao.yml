@@ -34,6 +34,27 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # jump.mingpao.com geo-blocks non-Hong Kong IPs, and GitHub runners are in
+      # the US. Tunnel through Surfshark's Hong Kong WireGuard server so the
+      # scraper egresses from an HK IP. Only the client PrivateKey is secret.
+      - name: Connect Hong Kong VPN (Surfshark WireGuard)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wireguard-tools
+          sudo mkdir -p /etc/wireguard
+          sudo bash -c 'umask 077; cat > /etc/wireguard/wg0.conf' <<EOF
+          [Interface]
+          PrivateKey = ${{ secrets.WG_PRIVATE_KEY }}
+          Address = 10.14.0.2/16
+          [Peer]
+          PublicKey = JYHdktdtuM7inbtsxRKSDpnBVTWQ5+QLZ/cWWmf4VRg=
+          AllowedIPs = 0.0.0.0/0
+          Endpoint = hk-hkg.prod.surfshark.com:51820
+          PersistentKeepalive = 25
+          EOF
+          sudo wg-quick up wg0
+          echo "VPN egress IP: $(curl -s --max-time 20 https://api.ipify.org || echo unknown)"
+
       - name: Run Mingpao scraper
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -41,6 +62,10 @@ jobs:
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           FORCE_SEND: ${{ github.event.inputs.force }}
         run: python mingpao_jobs.py
+
+      - name: Disconnect VPN
+        if: always()
+        run: sudo wg-quick down wg0 || true
 
       - name: Commit updated state files
         run: |
