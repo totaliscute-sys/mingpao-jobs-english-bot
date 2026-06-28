@@ -359,7 +359,9 @@ KEYWORDS = ["english", "英文", "英文科", "English Teacher", "老師", "教�
 
 # --- Performance / search-depth tuning ---
 NUM_PAGES = 12          # listing pages to scan (more = searches further back)
-FETCH_WORKERS = 12      # parallel HTTP workers for fetching job-detail pages
+FETCH_WORKERS = 4       # parallel HTTP workers for fetching job-detail pages
+                        # (kept low: requests go through a single WireGuard VPN
+                        # tunnel, which drops connections under high concurrency)
 PAGE_SLEEP = 0.3        # seconds between listing-page fetches
 # Date windows (hours) tried in order until we have >=3 jobs; widened well past
 # 7 days so the bot keeps searching further when recent posts are scarce.
