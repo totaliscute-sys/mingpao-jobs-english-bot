@@ -1266,8 +1266,18 @@ def main():
         return
 
     # 1. Fetch listing pages and pre-filter candidates
+    pages = fetch_listing_pages()
+    ok_pages = sum(1 for h in pages if h)
+    if ok_pages == 0:
+        # Every page failed to load -> the source site (jump.mingpao.com) is
+        # unreachable, NOT "no jobs". Stay silent and DON'T mark today as sent,
+        # so the bot keeps retrying and auto-resumes once the site is back up.
+        print("⚠️ 所有頁面抓取失敗 — 源網站 jump.mingpao.com 連線失敗，"
+              "今次唔發送、唔記錄，稍後自動重試。")
+        return
+
     all_jobs = []
-    for html in fetch_listing_pages():
+    for html in pages:
         if not html:
             continue
         for job in parse_job_listings(html):
