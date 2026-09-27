@@ -359,9 +359,10 @@ KEYWORDS = ["english", "英文", "英文科", "English Teacher", "老師", "教�
 
 # --- Performance / search-depth tuning ---
 NUM_PAGES = 12          # listing pages to scan (more = searches further back)
-FETCH_WORKERS = 4       # parallel HTTP workers for fetching job-detail pages
-                        # (kept low: requests go through a single WireGuard VPN
-                        # tunnel, which drops connections under high concurrency)
+FETCH_WORKERS = 1       # detail pages fetched one at a time: over the single
+                        # WireGuard tunnel mingpao drops/rate-limits (429)
+                        # concurrent requests, while sequential fetches succeed
+DETAIL_SLEEP = 1.0      # seconds between detail-page fetches
 PAGE_SLEEP = 0.3        # seconds between listing-page fetches
 # Date windows (hours) tried in order until we have >=3 jobs; widened well past
 # 7 days so the bot keeps searching further when recent posts are scarce.
@@ -392,16 +393,22 @@ def send_telegram_message(message):
         return None
 
 
-def fetch_page(url, params=None):
-    """Fetch page with retries"""
-    for attempt in range(3):
+def fetch_page(url, params=None, attempts=4):
+    """Fetch page with retries and backoff (mingpao rate-limits / drops
+    connections over the VPN, so back off progressively; longer on HTTP 429)."""
+    for attempt in range(attempts):
         try:
             response = requests.get(url, params=params, headers=HEADERS, timeout=30, verify=False)
+            if response.status_code == 429:
+                raise requests.HTTPError("429 Too Many Requests")
             response.raise_for_status()
             return response.text
         except Exception as e:
             print(f"Attempt {attempt + 1} failed: {e}")
-            time.sleep(2)
+            wait = 3 * (attempt + 1)
+            if '429' in str(e):
+                wait *= 3
+            time.sleep(wait)
     return None
 
 
@@ -1150,15 +1157,23 @@ _detail_cache = {}
 
 
 def prefetch_details(jobs):
-    """Fetch all job-detail pages in PARALLEL and attach content/salary to jobs.
+    """Fetch job-detail pages (once each) and attach content/salary to jobs.
 
-    This is the single biggest speed-up: previously each date window re-fetched
-    the same detail pages sequentially (10x+ redundant work). Now every unique
-    job is fetched exactly once, concurrently.
+    Sequential with a short pause when FETCH_WORKERS == 1 (mingpao rate-limits
+    concurrent requests over the VPN); parallel otherwise.
     """
     to_fetch = [j for j in jobs if j['url'] not in _detail_cache]
-    print(f"\n🌐 並行抓取 {len(to_fetch)} 個職位詳情 ({FETCH_WORKERS} workers)...")
-    if to_fetch:
+    print(f"\n🌐 抓取 {len(to_fetch)} 個職位詳情 ({FETCH_WORKERS} worker(s))...")
+    empty = {'content': '', 'salary': 'Not specified'}
+    if FETCH_WORKERS <= 1:
+        for j in to_fetch:
+            try:
+                _detail_cache[j['url']] = fetch_job_details(j['url'])
+            except Exception as e:
+                print(f"   抓取失敗 {j['url']}: {e}")
+                _detail_cache[j['url']] = empty
+            time.sleep(DETAIL_SLEEP)
+    elif to_fetch:
         with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
             future_map = {ex.submit(fetch_job_details, j['url']): j['url'] for j in to_fetch}
             for fut in as_completed(future_map):
@@ -1167,11 +1182,35 @@ def prefetch_details(jobs):
                     _detail_cache[url] = fut.result()
                 except Exception as e:
                     print(f"   抓取失敗 {url}: {e}")
-                    _detail_cache[url] = {'content': '', 'salary': 'Not specified'}
+                    _detail_cache[url] = empty
+    failed = 0
     for j in jobs:
-        d = _detail_cache.get(j['url'], {'content': '', 'salary': 'Not specified'})
+        d = _detail_cache.get(j['url'], empty)
         j['content'] = d['content']
         j['salary'] = d['salary']
+        if j['url'] in {t['url'] for t in to_fetch} and not d['content']:
+            failed += 1
+    print(f"   詳情抓取失敗: {failed}/{len(to_fetch)}")
+
+
+def title_prescreen(job):
+    """Reject jobs whose TITLE (or school name) alone already rules them out,
+    so we don't waste rate-limited detail fetches on them. Returns a reason
+    string, or None if the job needs its detail page to decide."""
+    title = job['title']
+    is_support, kw = is_support_role(title)
+    if is_support:
+        return f'助理/支援職位 ({kw})'
+    sub = next((kw for kw in SUBSTITUTE_KEYWORDS if kw in title.lower()), None)
+    if sub:
+        return f'代課職位 ({sub})'
+    name_text = f"{title} {job.get('school', '')}"
+    if is_secondary_school(name_text) and not is_primary_school(name_text):
+        return '非小學'
+    ok, reason = is_english_subject(title, '')
+    if not ok and reason in ('title_is_net_teacher', 'title_has_other_subject', 'not_english_role'):
+        return f'非英文科 ({reason})'
+    return None
 
 
 def classify_jobs(jobs, sent_jobs):
@@ -1306,10 +1345,28 @@ def main():
     sent_jobs = load_sent_jobs()
     print(f"   已發送職位記錄: {len(sent_jobs)} 個")
 
-    # 2. Fetch all detail pages in parallel, then classify ONCE
-    prefetch_details(unique_jobs)
+    # 2. Title pre-screen (no network), then fetch detail pages only for jobs
+    #    that still need their content to decide, then classify ONCE.
+    prescreened = {}
+    for job in unique_jobs:
+        reason = title_prescreen(job)
+        if reason:
+            prescreened[job['url']] = reason
+    need_detail = [j for j in unique_jobs if j['url'] not in prescreened]
+    print(f"   標題預篩剔除 {len(prescreened)} 個，需要抓詳情 {len(need_detail)} 個")
+    prefetch_details(need_detail)
+    for job in unique_jobs:
+        job.setdefault('content', '')
+        job.setdefault('salary', 'Not specified')
     print(f"\n{'='*60}\n🔎 驗證職位...\n{'='*60}")
     verified_all, debug_results = classify_jobs(unique_jobs, sent_jobs)
+
+    # Debug: show every English-related title and why it was accepted/rejected,
+    # so "暫無符合條件" can be told apart from a scraping problem.
+    print("\n--- 含『英文/English』職位處理結果 ---")
+    for r in debug_results:
+        if '英文' in r['title'] or 'english' in r['title'].lower():
+            print(f"   [{r['status']}] {r['title'][:45]} | {r['school'][:20]} | {r['reason']}")
 
     accepted = sum(1 for r in debug_results if r['status'] == 'ACCEPTED')
     rejected = sum(1 for r in debug_results if r['status'] == 'REJECTED')
@@ -1356,6 +1413,9 @@ def main():
 
     print(f"\n📤 發送 {len(top_jobs)} 個職位...")
     message = format_message(top_jobs, search_hours)
+    if os.environ.get('DRY_RUN', '').strip().lower() == 'true':
+        print("🧪 DRY_RUN：唔發送、唔記錄。訊息預覽：\n" + message)
+        return
     result = send_telegram_message(message)
 
     if result and result.get('ok'):

@@ -15,6 +15,10 @@ on:
         description: 'Send even if a message was already sent today'
         type: boolean
         default: false
+      dry_run:
+        description: 'Debug run: scrape and log, but do not send or save'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -61,6 +65,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           FORCE_SEND: ${{ github.event.inputs.force }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: python mingpao_jobs.py
 
       - name: Disconnect VPN
